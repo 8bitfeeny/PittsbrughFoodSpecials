@@ -1,112 +1,144 @@
 import streamlit as st
+import easyocr
 from PIL import Image
-import pytesseract
 import sqlite3
 import re
 from datetime import datetime
 
-# --- Database Setup ---
-DB_NAME = 'restaurant_specials.db'
+# ----------------------
+# Database Setup
+# ----------------------
+DB_NAME = 'specials.db'
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Create a table for restaurants if it doesn't exist
     c.execute('''
-        CREATE TABLE IF NOT EXISTS specials (
+        CREATE TABLE IF NOT EXISTS daily_specials (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            restaurant_name TEXT NOT NULL,
-            special_details TEXT NOT NULL,
-            date_added TEXT NOT NULL
+            day TEXT,
+            special_description TEXT,
+            date_added TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-def save_special(restaurant_name, special_details):
+def save_special(day, special_desc):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO specials (restaurant_name, special_details, date_added)
+        INSERT INTO daily_specials (day, special_description, date_added)
         VALUES (?, ?, ?)
-    ''', (restaurant_name, special_details, datetime.now().isoformat()))
+    ''', (day, special_desc, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
-# --- OCR Function ---
-def extract_text_from_image(image):
-    # Use pytesseract to extract text
-    text = pytesseract.image_to_string(image)
-    return text
+# ----------------------
+# OCR and Parsing
+# ----------------------
+reader = easyocr.Reader(['en'], gpu=False)  # Initialize EasyOCR (CPU mode)
 
-# --- Simple Normalization ---
-def extract_restaurant_name(text):
+def ocr_image(image):
     """
-    A simple (and naive) function to try to extract a restaurant name.
-    Here we assume the restaurant name might be on the first line.
+    Use EasyOCR to read text from the given image.
+    Returns a list of text lines.
     """
-    lines = text.strip().split('\n')
-    if lines:
-        # A very simple heuristic: pick the first line with alphabetical characters.
-        for line in lines:
-            if re.search(r'[A-Za-z]', line):
-                return line.strip()
-    return "Unknown Restaurant"
+    results = reader.readtext(image, detail=0)  # detail=0 => text only
+    return results
 
-# --- Streamlit App ---
+def parse_specials(text_lines):
+    """
+    Attempt to parse lines of text to extract day-based specials.
+    This is a naive approach that looks for day names (Monday, Tuesday, etc.)
+    and groups subsequent lines until the next day is found.
+    """
+    days_of_week = [
+        "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday", "sunday"
+    ]
+
+    # Prepare a structure to hold {day: [list_of_special_lines]}
+    parsed_data = {}
+    current_day = None
+
+    for line in text_lines:
+        # Clean the line a bit
+        clean_line = line.strip().lower()
+
+        # Check if this line is a day name
+        if any(day in clean_line for day in days_of_week):
+            # Extract the exact day name
+            for d in days_of_week:
+                if d in clean_line:
+                    current_day = d.capitalize()
+                    parsed_data[current_day] = []
+                    break
+        else:
+            # If we already have a current_day, append line to that day's specials
+            if current_day:
+                parsed_data[current_day].append(line.strip())
+
+    # Convert lists of lines into single strings
+    for day in parsed_data:
+        parsed_data[day] = " | ".join(parsed_data[day])
+
+    return parsed_data
+
+# ----------------------
+# Streamlit App
+# ----------------------
 def main():
-    st.title("Pittsburgh Food Specials Finder")
-    st.write("Upload a photo of a restaurant special or paste the text details below.")
+    st.title("Pittsburgh Food Specials Finder (AI-powered OCR)")
 
-    # Option to choose input type
-    input_type = st.radio("Select input type:", ["Image", "Text"])
+    st.write("Upload an image of restaurant specials to parse and store them in a normalized format.")
 
-    extracted_text = ""
-    
-    if input_type == "Image":
-        uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
-        if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Image", use_column_width=True)
-            
-            # Extract text using OCR
-            if st.button("Extract Text from Image"):
-                with st.spinner("Processing image..."):
-                    extracted_text = extract_text_from_image(image)
-                    st.text_area("Extracted Text", extracted_text, height=200)
-    else:
-        extracted_text = st.text_area("Paste text here", height=200)
+    uploaded_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
 
-    # If text is available, try to normalize/extract data
-    if extracted_text:
-        st.subheader("Normalize Data")
-        # Try to extract a restaurant name from the text as a starting point.
-        default_name = extract_restaurant_name(extracted_text)
-        restaurant_name = st.text_input("Restaurant Name", default_name)
-        special_details = st.text_area("Special Details", extracted_text)
+    if uploaded_file is not None:
+        # Display the uploaded image
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Uploaded image", use_column_width=True)
 
-        if st.button("Save Special"):
-            if restaurant_name and special_details:
-                save_special(restaurant_name, special_details)
-                st.success("Special saved successfully!")
-            else:
-                st.error("Please provide both restaurant name and special details.")
+        # Run OCR
+        if st.button("Extract and Parse Specials"):
+            with st.spinner("Extracting text from image..."):
+                text_lines = ocr_image(uploaded_file)
+                st.subheader("Raw OCR Output")
+                st.write(text_lines)
 
-    # Optionally, display saved records
-    st.subheader("Saved Food Specials")
-    if st.button("Refresh List"):
+                # Parse out daily specials
+                specials_dict = parse_specials(text_lines)
+                st.subheader("Parsed Specials")
+                if specials_dict:
+                    for day, desc in specials_dict.items():
+                        st.write(f"**{day}:** {desc}")
+                else:
+                    st.write("No recognizable daily specials found. Try adjusting your parsing logic.")
+
+                # Optionally save to DB
+                st.subheader("Save to Database")
+                if st.button("Save All Parsed Specials"):
+                    for day, desc in specials_dict.items():
+                        save_special(day, desc)
+                    st.success("Saved to database!")
+
+    # Show existing specials from DB
+    st.subheader("View Saved Specials")
+    if st.button("Load Saved Specials"):
         conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
-        c.execute("SELECT restaurant_name, special_details, date_added FROM specials ORDER BY date_added DESC")
+        c.execute("SELECT day, special_description, date_added FROM daily_specials ORDER BY date_added DESC")
         rows = c.fetchall()
         conn.close()
-        
+
         if rows:
             for row in rows:
-                st.markdown(f"**{row[0]}**  \n{row[1]}  \n*Added on {row[2]}*")
+                day, desc, date_added = row
+                st.markdown(f"**Day**: {day}\n\n**Special**: {desc}\n\n*Added on: {date_added}*")
                 st.markdown("---")
         else:
-            st.info("No specials saved yet.")
+            st.info("No specials found in the database.")
 
 if __name__ == "__main__":
     init_db()
